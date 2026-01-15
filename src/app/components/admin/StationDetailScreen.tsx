@@ -4,7 +4,7 @@ import { Button } from "../ui/button";
 import { ArrowLeft, MapPin, Thermometer, Droplets, Activity, Zap, BatteryCharging } from "lucide-react";
 
 import { ref, onValue, type Unsubscribe } from "firebase/database";
-import { db } from "../../../lib/firebase"; // ✅ dùng relative cho chắc
+import { db } from "../../../lib/firebase";
 import { listenEnv, listenPzem, type EnvData, type PzemData } from "../../../lib/rtdb";
 
 interface StationDetailScreenProps {
@@ -31,8 +31,6 @@ type PortStatus = {
   ts?: number;
 };
 
-type StationUsers = Record<string, { name?: string; email?: string }>;
-
 type SessionData = {
   costVnd?: number;
   energyKwh?: number;
@@ -44,6 +42,9 @@ type SessionData = {
   userId?: string;
   stationId?: number;
 };
+
+// ✅ user info chỉ đọc theo user đang sạc
+type UserInfo = { name?: string; email?: string };
 
 function tsToMs(ts?: number) {
   if (!ts) return null;
@@ -74,27 +75,27 @@ export function StationDetailScreen({ stationId, onBack }: StationDetailScreenPr
   const meta = META[stationId] ?? { name: `Trạm ${stationId}`, location: "-" };
 
   const [env, setEnv] = useState<EnvData | null>(null);
-  const [users, setUsers] = useState<StationUsers | null>(null);
 
   const [pzem, setPzem] = useState<Record<PortName, PzemData | null>>({ A: null, B: null });
   const [status, setStatus] = useState<Record<PortName, PortStatus | null>>({ A: null, B: null });
-
   const [sessions, setSessions] = useState<Record<PortName, SessionData | null>>({ A: null, B: null });
+
+  // ✅ chỉ giữ user info của user đang sạc theo từng port
+  const [userInfoByPort, setUserInfoByPort] = useState<Record<PortName, UserInfo | null>>({ A: null, B: null });
 
   // giữ unsubscribe session theo từng port để đổi sessionId là unsubscribe cái cũ
   const sessionUnsubRef = useRef<Record<PortName, Unsubscribe | null>>({ A: null, B: null });
   const lastSessionIdRef = useRef<Record<PortName, string | null>>({ A: null, B: null });
 
+  // ✅ giữ unsubscribe user theo từng port để đổi userId là unsubscribe cái cũ
+  const userUnsubRef = useRef<Record<PortName, Unsubscribe | null>>({ A: null, B: null });
+  const lastUserIdRef = useRef<Record<PortName, string | null>>({ A: null, B: null });
+
   useEffect(() => {
-    // env realtime
     const offEnv = listenEnv(stationId, (v) => setEnv(v));
 
-    // users theo trạm
-    const usersRef = ref(db, `stations/${stationId}/users`);
-    const offUsers = onValue(usersRef, (snap) => setUsers((snap.val() ?? null) as StationUsers | null));
-
-    // pzem + status + session per port
     const offs: Array<() => void> = [];
+
     PORTS.forEach((port) => {
       // pzem
       offs.push(
@@ -103,7 +104,7 @@ export function StationDetailScreen({ stationId, onBack }: StationDetailScreenPr
         })
       );
 
-      // full status (để lấy sessionId/userId/startTs...)
+      // status
       const stRef = ref(db, `stations/${stationId}/ports/${port}/status`);
       const offSt = onValue(stRef, (snap) => {
         const st = (snap.val() ?? null) as PortStatus | null;
@@ -115,18 +116,16 @@ export function StationDetailScreen({ stationId, onBack }: StationDetailScreenPr
         if (lastSessionIdRef.current[port] !== newSessionId) {
           lastSessionIdRef.current[port] = newSessionId;
 
-          // off cũ
           if (sessionUnsubRef.current[port]) {
             sessionUnsubRef.current[port]!();
             sessionUnsubRef.current[port] = null;
           }
-          // clear data session nếu null
+
           if (!newSessionId) {
             setSessions((prev) => ({ ...prev, [port]: null }));
             return;
           }
 
-          // on session mới
           const sRef = ref(db, `sessions/${newSessionId}`);
           const offS = onValue(sRef, (ss) => {
             setSessions((prev) => ({ ...prev, [port]: (ss.val() ?? null) as SessionData | null }));
@@ -140,15 +139,50 @@ export function StationDetailScreen({ stationId, onBack }: StationDetailScreenPr
 
     return () => {
       offEnv?.();
-      offUsers?.();
       offs.forEach((u) => u?.());
+
       PORTS.forEach((port) => {
         if (sessionUnsubRef.current[port]) sessionUnsubRef.current[port]!();
         sessionUnsubRef.current[port] = null;
         lastSessionIdRef.current[port] = null;
+
+        if (userUnsubRef.current[port]) userUnsubRef.current[port]!();
+        userUnsubRef.current[port] = null;
+        lastUserIdRef.current[port] = null;
       });
     };
   }, [stationId]);
+
+  // ✅ theo dõi userId "thực" (ưu tiên session.userId) và chỉ subscribe đúng /users/{uid}
+  useEffect(() => {
+    PORTS.forEach((port) => {
+      const uid = (sessions[port]?.userId ?? status[port]?.userId ?? null) as string | null;
+
+      if (lastUserIdRef.current[port] === uid) return;
+      lastUserIdRef.current[port] = uid;
+
+      // off user cũ
+      if (userUnsubRef.current[port]) {
+        userUnsubRef.current[port]!();
+        userUnsubRef.current[port] = null;
+      }
+
+      // không có uid => clear
+      if (!uid) {
+        setUserInfoByPort((prev) => ({ ...prev, [port]: null }));
+        return;
+      }
+
+      // on user mới
+      const uRef = ref(db, `users/${uid}`);
+      const offU = onValue(uRef, (snap) => {
+        setUserInfoByPort((prev) => ({ ...prev, [port]: (snap.val() ?? null) as UserInfo | null }));
+      });
+      userUnsubRef.current[port] = offU;
+    });
+
+    // cleanup của effect này không cần off hết vì đã handle theo uid change + unmount ở effect trên
+  }, [sessions, status]);
 
   const chargingCount = useMemo(() => {
     return PORTS.filter((p) => status[p]?.isCharging).length;
@@ -255,13 +289,16 @@ export function StationDetailScreen({ stationId, onBack }: StationDetailScreenPr
             const ses = sessions[key];
 
             const userId = (ses?.userId ?? st?.userId ?? "") as string;
-            const userName = userId && users?.[userId]?.name ? users![userId]!.name! : userId || "-";
+
+            // ✅ user đang sạc (đúng theo port)
+            const u = userInfoByPort[key];
+            const userName = u?.name ?? userId ?? "-";
+            const userEmail = u?.email ?? "-";
 
             const powerW = Number(pm?.p ?? 0);
             const voltageV = Number(pm?.u ?? 0);
             const currentA = Number(pm?.i ?? 0);
 
-            // ✅ ưu tiên energy/cost theo session (chuẩn), fallback sang pzem.e
             const energyKwh = Number(ses?.energyKwh ?? pm?.e ?? 0);
             const costVnd = Math.round(Number(ses?.costVnd ?? energyKwh * PRICE_VND_PER_KWH));
 
@@ -297,6 +334,10 @@ export function StationDetailScreen({ stationId, onBack }: StationDetailScreenPr
                           <div className="flex justify-between">
                             <span className="text-gray-600">UID:</span>
                             <span className="font-semibold">{userId || "-"}</span>
+                          </div>
+                          <div className="flex justify-between">
+                            <span className="text-gray-600">Email:</span>
+                            <span className="font-semibold break-all">{userEmail}</span>
                           </div>
                         </div>
                       </div>

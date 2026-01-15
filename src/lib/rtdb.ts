@@ -107,3 +107,47 @@ export async function setCharging(stationId: StationId, port: PortId, isCharging
   await ensureAnonAuth();
   await update(portStatusRef(stationId, port), { isCharging });
 }
+type Settings = {
+  tempThresholdC?: number;
+  priceVndPerKwh?: number;
+};
+
+const settingsRef = () => ref(db, "settings");
+
+export async function readSettings() {
+  await ensureAnonAuth();
+  const snap = await get(settingsRef());
+  return (snap.val() ?? null) as Settings | null;
+}
+
+export function listenSettings(cb: (v: Settings | null) => void) {
+  let unsub: (() => void) | null = null;
+  let cancelled = false;
+
+  ensureAnonAuth()
+    .then(() => {
+      if (cancelled) return;
+      unsub = onValue(
+        settingsRef(),
+        (snap) => cb((snap.val() ?? null) as Settings | null),
+        (err) => {
+          console.error("[RTDB] listenSettings error:", (err as any)?.code || err);
+          cb(null);
+        }
+      );
+    })
+    .catch((e) => {
+      console.error("[RTDB] ensureAnonAuth failed:", e);
+      cb(null);
+    });
+
+  return () => {
+    cancelled = true;
+    if (unsub) unsub();
+  };
+}
+
+export async function setTempThresholdC(tempThresholdC: number) {
+  await ensureAnonAuth();
+  await update(settingsRef(), { tempThresholdC });
+}
