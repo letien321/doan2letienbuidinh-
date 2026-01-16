@@ -5,7 +5,7 @@ import { ArrowLeft, MapPin, Thermometer, Droplets, Activity, Zap, BatteryChargin
 
 import { ref, onValue, type Unsubscribe } from "firebase/database";
 import { db } from "../../../lib/firebase";
-import { listenEnv, listenPzem, type EnvData, type PzemData } from "../../../lib/rtdb";
+import { listenEnv, listenPzem, listenRfidUid, listenUser, type EnvData, type PzemData, type UserInfo } from "../../../lib/rtdb";
 
 interface StationDetailScreenProps {
   stationId: number;
@@ -24,7 +24,7 @@ type PortName = (typeof PORTS)[number];
 type PortStatus = {
   isCharging?: boolean;
   sessionId?: string;
-  userId?: string;
+  userId?: string; // cardId (RFID)
   startTs?: number;
   stopTs?: number;
   fault?: string;
@@ -34,31 +34,22 @@ type PortStatus = {
 type SessionData = {
   costVnd?: number;
   energyKwh?: number;
-  port?: string;
-  reason?: string;
   startTs?: number;
   stopTs?: number;
-  updatedTs?: number;
-  userId?: string;
-  stationId?: number;
+  userId?: string; // cardId (RFID) hoặc uid, tuỳ bạn ghi
 };
-
-// ✅ user info chỉ đọc theo user đang sạc
-type UserInfo = { name?: string; email?: string };
 
 function tsToMs(ts?: number) {
   if (!ts) return null;
-  if (ts > 1_000_000_000_000) return ts; // ms epoch
-  if (ts > 1_000_000_000) return ts * 1000; // s epoch
-  return null; // millis() của MCU / counter => không convert
+  if (ts > 1_000_000_000_000) return ts;
+  if (ts > 1_000_000_000) return ts * 1000;
+  return null;
 }
-
 function formatTime(ts?: number) {
   const ms = tsToMs(ts);
   if (!ms) return "-";
   return new Date(ms).toLocaleTimeString("vi-VN", { hour12: false });
 }
-
 function formatDuration(startTs?: number, stopTs?: number) {
   const s = tsToMs(startTs);
   const e = tsToMs(stopTs) ?? Date.now();
@@ -75,36 +66,33 @@ export function StationDetailScreen({ stationId, onBack }: StationDetailScreenPr
   const meta = META[stationId] ?? { name: `Trạm ${stationId}`, location: "-" };
 
   const [env, setEnv] = useState<EnvData | null>(null);
-
   const [pzem, setPzem] = useState<Record<PortName, PzemData | null>>({ A: null, B: null });
   const [status, setStatus] = useState<Record<PortName, PortStatus | null>>({ A: null, B: null });
   const [sessions, setSessions] = useState<Record<PortName, SessionData | null>>({ A: null, B: null });
 
-  // ✅ chỉ giữ user info của user đang sạc theo từng port
+  const [resolvedUidByPort, setResolvedUidByPort] = useState<Record<PortName, string | null>>({ A: null, B: null });
   const [userInfoByPort, setUserInfoByPort] = useState<Record<PortName, UserInfo | null>>({ A: null, B: null });
 
-  // giữ unsubscribe session theo từng port để đổi sessionId là unsubscribe cái cũ
   const sessionUnsubRef = useRef<Record<PortName, Unsubscribe | null>>({ A: null, B: null });
   const lastSessionIdRef = useRef<Record<PortName, string | null>>({ A: null, B: null });
 
-  // ✅ giữ unsubscribe user theo từng port để đổi userId là unsubscribe cái cũ
+  const rfidUnsubRef = useRef<Record<PortName, Unsubscribe | null>>({ A: null, B: null });
+  const lastRfidRef = useRef<Record<PortName, string | null>>({ A: null, B: null });
+
   const userUnsubRef = useRef<Record<PortName, Unsubscribe | null>>({ A: null, B: null });
-  const lastUserIdRef = useRef<Record<PortName, string | null>>({ A: null, B: null });
+  const lastUidRef = useRef<Record<PortName, string | null>>({ A: null, B: null });
 
   useEffect(() => {
     const offEnv = listenEnv(stationId, (v) => setEnv(v));
-
     const offs: Array<() => void> = [];
 
     PORTS.forEach((port) => {
-      // pzem
       offs.push(
         listenPzem(stationId, port, (v) => {
           setPzem((prev) => ({ ...prev, [port]: v }));
         })
       );
 
-      // status
       const stRef = ref(db, `stations/${stationId}/ports/${port}/status`);
       const offSt = onValue(stRef, (snap) => {
         const st = (snap.val() ?? null) as PortStatus | null;
@@ -112,7 +100,6 @@ export function StationDetailScreen({ stationId, onBack }: StationDetailScreenPr
 
         const newSessionId = st?.sessionId ?? null;
 
-        // nếu sessionId đổi => unsubscribe session cũ và subscribe session mới
         if (lastSessionIdRef.current[port] !== newSessionId) {
           lastSessionIdRef.current[port] = newSessionId;
 
@@ -146,51 +133,67 @@ export function StationDetailScreen({ stationId, onBack }: StationDetailScreenPr
         sessionUnsubRef.current[port] = null;
         lastSessionIdRef.current[port] = null;
 
+        if (rfidUnsubRef.current[port]) rfidUnsubRef.current[port]!();
+        rfidUnsubRef.current[port] = null;
+        lastRfidRef.current[port] = null;
+
         if (userUnsubRef.current[port]) userUnsubRef.current[port]!();
         userUnsubRef.current[port] = null;
-        lastUserIdRef.current[port] = null;
+        lastUidRef.current[port] = null;
       });
     };
   }, [stationId]);
 
-  // ✅ theo dõi userId "thực" (ưu tiên session.userId) và chỉ subscribe đúng /users/{uid}
+  // cardId -> uid (rfidMap)
   useEffect(() => {
     PORTS.forEach((port) => {
-      const uid = (sessions[port]?.userId ?? status[port]?.userId ?? null) as string | null;
+      const cardId = (sessions[port]?.userId ?? status[port]?.userId ?? null) as string | null;
 
-      if (lastUserIdRef.current[port] === uid) return;
-      lastUserIdRef.current[port] = uid;
+      if (lastRfidRef.current[port] === cardId) return;
+      lastRfidRef.current[port] = cardId;
 
-      // off user cũ
+      if (rfidUnsubRef.current[port]) {
+        rfidUnsubRef.current[port]!();
+        rfidUnsubRef.current[port] = null;
+      }
+
+      if (!cardId) {
+        setResolvedUidByPort((prev) => ({ ...prev, [port]: null }));
+        return;
+      }
+
+      rfidUnsubRef.current[port] = listenRfidUid(cardId, (uid) => {
+        setResolvedUidByPort((prev) => ({ ...prev, [port]: uid ?? null }));
+      });
+    });
+  }, [sessions, status]);
+
+  // uid -> users/{uid}
+  useEffect(() => {
+    PORTS.forEach((port) => {
+      const uid = resolvedUidByPort[port];
+
+      if (lastUidRef.current[port] === uid) return;
+      lastUidRef.current[port] = uid;
+
       if (userUnsubRef.current[port]) {
         userUnsubRef.current[port]!();
         userUnsubRef.current[port] = null;
       }
 
-      // không có uid => clear
       if (!uid) {
         setUserInfoByPort((prev) => ({ ...prev, [port]: null }));
         return;
       }
 
-      // on user mới
-      const uRef = ref(db, `users/${uid}`);
-      const offU = onValue(uRef, (snap) => {
-        setUserInfoByPort((prev) => ({ ...prev, [port]: (snap.val() ?? null) as UserInfo | null }));
+      userUnsubRef.current[port] = listenUser(uid, (u) => {
+        setUserInfoByPort((prev) => ({ ...prev, [port]: u }));
       });
-      userUnsubRef.current[port] = offU;
     });
+  }, [resolvedUidByPort]);
 
-    // cleanup của effect này không cần off hết vì đã handle theo uid change + unmount ở effect trên
-  }, [sessions, status]);
-
-  const chargingCount = useMemo(() => {
-    return PORTS.filter((p) => status[p]?.isCharging).length;
-  }, [status]);
-
-  const totalPowerW = useMemo(() => {
-    return Math.round((pzem.A?.p ?? 0) + (pzem.B?.p ?? 0));
-  }, [pzem]);
+  const chargingCount = useMemo(() => PORTS.filter((p) => status[p]?.isCharging).length, [status]);
+  const totalPowerW = useMemo(() => Math.round((pzem.A?.p ?? 0) + (pzem.B?.p ?? 0)), [pzem]);
 
   const temp = env?.temp ?? 0;
   const hum = env?.hum ?? 0;
@@ -288,11 +291,11 @@ export function StationDetailScreen({ stationId, onBack }: StationDetailScreenPr
             const pm = pzem[key];
             const ses = sessions[key];
 
-            const userId = (ses?.userId ?? st?.userId ?? "") as string;
-
-            // ✅ user đang sạc (đúng theo port)
+            const cardId = (ses?.userId ?? st?.userId ?? "") as string;
+            const uid = resolvedUidByPort[key];
             const u = userInfoByPort[key];
-            const userName = u?.name ?? userId ?? "-";
+
+            const userName = u?.name ?? (uid ? uid : cardId) ?? "-";
             const userEmail = u?.email ?? "-";
 
             const powerW = Number(pm?.p ?? 0);
@@ -331,14 +334,23 @@ export function StationDetailScreen({ stationId, onBack }: StationDetailScreenPr
                             <span className="text-gray-600">Người dùng:</span>
                             <span className="font-semibold">{userName}</span>
                           </div>
+
                           <div className="flex justify-between">
                             <span className="text-gray-600">UID:</span>
-                            <span className="font-semibold">{userId || "-"}</span>
+                            <span className="font-semibold">{uid ?? "-"}</span>
                           </div>
+
+                          <div className="flex justify-between">
+                            <span className="text-gray-600">Thẻ:</span>
+                            <span className="font-semibold">{cardId || "-"}</span>
+                          </div>
+
                           <div className="flex justify-between">
                             <span className="text-gray-600">Email:</span>
                             <span className="font-semibold break-all">{userEmail}</span>
                           </div>
+
+                          {!uid && cardId && <div className="mt-2 text-xs text-orange-700">Chưa bind thẻ → uid (thiếu rfidMap/{cardId})</div>}
                         </div>
                       </div>
 
@@ -355,7 +367,7 @@ export function StationDetailScreen({ stationId, onBack }: StationDetailScreenPr
                           </div>
                           <div className="p-3 bg-gray-50 rounded-lg col-span-2">
                             <p className="text-xs text-gray-600 mb-1">Session</p>
-                            <p className="font-bold text-gray-900 break-all">{ses ? st?.sessionId : st?.sessionId || "-"}</p>
+                            <p className="font-bold text-gray-900 break-all">{st?.sessionId || "-"}</p>
                           </div>
                         </div>
                       </div>
@@ -380,20 +392,6 @@ export function StationDetailScreen({ stationId, onBack }: StationDetailScreenPr
                             <p className="font-bold text-gray-900">{energyKwh.toFixed(3)} kWh</p>
                           </div>
                         </div>
-                      </div>
-
-                      {!!st?.fault && (
-                        <div className="p-4 bg-red-50 rounded-lg border border-red-200">
-                          <p className="font-semibold text-red-700">Lỗi: {st.fault}</p>
-                        </div>
-                      )}
-
-                      <div className="p-4 bg-gradient-to-r from-orange-50 to-red-50 rounded-lg border-2 border-orange-200">
-                        <div className="flex items-center justify-between">
-                          <span className="font-semibold text-gray-900">Chi phí hiện tại</span>
-                          <span className="text-2xl font-bold text-orange-600">{costVnd.toLocaleString("vi-VN")} đ</span>
-                        </div>
-                        <p className="text-xs text-gray-600 mt-1">Giá điện: 4.500đ/kWh</p>
                       </div>
                     </>
                   ) : (
